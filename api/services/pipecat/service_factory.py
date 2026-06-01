@@ -25,7 +25,8 @@ from pipecat.services.deepgram.tts import DeepgramTTSService, DeepgramTTSSetting
 from pipecat.services.dograh.llm import DograhLLMService
 from pipecat.services.dograh.stt import DograhSTTService, DograhSTTSettings
 from pipecat.services.dograh.tts import DograhTTSService, DograhTTSSettings
-from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, ElevenLabsTTSSettings
+from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, ElevenLabsTTSSettings  # noqa: F401
+from api.services.pipecat.elevenlabs_tts_safe import ElevenLabsTTSServiceNoVoiceSettings
 from pipecat.services.gladia.stt import GladiaSTTService, GladiaSTTSettings
 from pipecat.services.google.llm import GoogleLLMService, GoogleLLMSettings
 from pipecat.services.google.stt import GoogleSTTService, GoogleSTTSettings
@@ -107,9 +108,10 @@ def create_stt_service(
             sample_rate=audio_config.transport_in_sample_rate,
         )
     elif user_config.stt.provider == ServiceProviders.OPENAI.value:
+        language = getattr(user_config.stt, "language", None) or "en"
         return OpenAISTTService(
             api_key=user_config.stt.api_key,
-            settings=OpenAISTTSettings(model=user_config.stt.model),
+            settings=OpenAISTTSettings(model=user_config.stt.model, language=language),
         )
     elif user_config.stt.provider == ServiceProviders.GOOGLE.value:
         language = getattr(user_config.stt, "language", None) or "en-US"
@@ -261,8 +263,17 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
             silence_time_s=1.0,
         )
     elif user_config.tts.provider == ServiceProviders.OPENAI.value:
+        # OpenAI TTS always returns PCM at its native 24kHz regardless of
+        # what sample rate we request. We must declare 24000 here so the
+        # outgoing TTSAudioRawFrame is labeled correctly; the downstream
+        # MediaSender's resampler then actually downsamples to the
+        # transport's wire rate (8kHz for telephony). Without this, the
+        # frame is labeled with pipeline_sample_rate (8000 on telephony) →
+        # resampler is a no-op → 24kHz bytes are sent at 8kHz playback
+        # rate → audio plays ~3x slower and ~1 octave lower.
         return OpenAITTSService(
             api_key=user_config.tts.api_key,
+            sample_rate=24000,
             settings=OpenAITTSSettings(model=user_config.tts.model),
             text_filters=[xml_function_tag_filter],
             skip_aggregator_types=["recording_router", "recording"],
@@ -304,17 +315,24 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
         elevenlabs_url = user_config.tts.base_url.replace("https://", "wss://").replace(
             "http://", "ws://"
         )
-        return ElevenLabsTTSService(
+        # Use the no-voice-settings subclass to dodge the 1008 policy
+        # violation that fires when the WS keepalive sends the first empty
+        # message before the first audio context (see
+        # ``elevenlabs_tts_safe.py`` for the full rationale).
+        # ``voice`` and ``model`` go through the URL, so they're still
+        # honoured; per-call stability/similarity/speed overrides are
+        # dropping — configure them on the ElevenLabs Voice instead.
+        language = getattr(user_config.tts, "language", None) or "en"
+        return ElevenLabsTTSServiceNoVoiceSettings(
             reconnect_on_error=False,
             api_key=user_config.tts.api_key,
             url=elevenlabs_url,
             settings=ElevenLabsTTSSettings(
                 voice=voice_id,
                 model=user_config.tts.model,
-                stability=0.8,
-                speed=user_config.tts.speed,
-                similarity_boost=0.75,
+                language=language,
             ),
+
             text_filters=[xml_function_tag_filter],
             skip_aggregator_types=["recording_router", "recording"],
             silence_time_s=1.0,

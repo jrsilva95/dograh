@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validat
 from api.services.configuration.options import (
     DEEPGRAM_LANGUAGES,
     DEEPGRAM_STT_MODELS,
+    ELEVENLABS_LANGUAGES,
     GLADIA_STT_LANGUAGES,
     GLADIA_STT_MODELS,
     GOOGLE_MODELS,
@@ -21,6 +22,8 @@ from api.services.configuration.options import (
     GOOGLE_VERTEX_REALTIME_LANGUAGES,
     GOOGLE_VERTEX_REALTIME_MODELS,
     GOOGLE_VERTEX_REALTIME_VOICES,
+    OPENAI_STT_LANGUAGES,
+    OPENAI_STT_MODELS,
     SARVAM_LANGUAGES,
     SARVAM_STT_MODELS,
     SARVAM_TTS_MODELS,
@@ -715,6 +718,15 @@ class ElevenlabsTTSConfiguration(BaseServiceConfiguration):
         description="ElevenLabs TTS model.",
         json_schema_extra={"examples": ELEVENLABS_TTS_MODELS},
     )
+    language: str = Field(
+        default="en",
+        description="ISO 639-1 language code (required for multilingual models).",
+        json_schema_extra={
+            "examples": ELEVENLABS_LANGUAGES,
+            "allow_custom_input": True,
+            "docs_url": "https://elevenlabs.io/docs/languages",
+        },
+    )
     base_url: str = Field(
         default="https://api.elevenlabs.io",
         description=(
@@ -1045,9 +1057,6 @@ class CartesiaSTTConfiguration(BaseSTTConfiguration):
     )
 
 
-OPENAI_STT_MODELS = ["gpt-4o-transcribe"]
-
-
 @register_stt
 class OpenAISTTConfiguration(BaseSTTConfiguration):
     model_config = OPENAI_PROVIDER_MODEL_CONFIG
@@ -1056,6 +1065,15 @@ class OpenAISTTConfiguration(BaseSTTConfiguration):
         default="gpt-4o-transcribe",
         description="OpenAI transcription model.",
         json_schema_extra={"examples": OPENAI_STT_MODELS},
+    )
+    language: str = Field(
+        default="en",
+        description="ISO 639-1 language code.",
+        json_schema_extra={
+            "examples": OPENAI_STT_LANGUAGES,
+            "allow_custom_input": True,
+            "docs_url": "https://platform.openai.com/docs/guides/speech-to-text/supported-languages",
+        },
     )
 
 

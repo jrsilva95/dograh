@@ -63,6 +63,16 @@ async def lifespan(app: FastAPI):
         await sync_manager.start()
         set_worker_sync_manager(sync_manager)
 
+        # Pre-register SIP/pyVoIP phones so inbound INVITEs route immediately
+        # after a restart, instead of requiring a bootstrap outbound first.
+        # No-op when no SIP configs exist in the DB.
+        from api.services.telephony.providers.sip import startup_phones as _sip_startup
+
+        try:
+            await _sip_startup()
+        except Exception:
+            logger.exception("SIP startup_phones failed; inbound SIP will not work until an outbound bootstraps the phone")
+
         yield  # Run app
 
         # Shutdown sequence - this runs when FastAPI is shutting down
