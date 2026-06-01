@@ -1,41 +1,53 @@
+# syntax=docker/dockerfile:1
 # Multi-stage Dockerfile
-# Stage 1: Builder - Install Python dependencies
-FROM python:3.12-slim AS builder
+# Stage 1: Builder - Install Python dependencies into a venv via uv
+# (mirrors .devcontainer/Dockerfile's venv-builder stage).
+FROM python:3.13-slim AS builder
 
 WORKDIR /app
 
-# Install git in builder stage (needed for pip install from git)
+# Install git in builder stage (needed for any pip install from git URLs)
 RUN apt-get update && apt-get install -y \
     git \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy and install requirements
-COPY api/requirements.txt .
+# uv (https://github.com/astral-sh/uv) for ~5-10x faster installs than pip.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
-# Install dependencies to user directory for easy copying
-RUN pip install --user --no-cache-dir -r requirements.txt && \
-    # Clean up pip cache after installation
-    rm -rf /root/.cache/pip
+# Build the venv at the path it will live at in the final image, so shebangs
+# and console-scripts inside the venv reference the correct runtime location
+# after COPY --from.
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH
+RUN python -m venv "$VIRTUAL_ENV"
 
-# Copy and install pipecat from local submodule
-COPY pipecat /tmp/pipecat
-RUN pip install --user --no-cache-dir '/tmp/pipecat[cartesia,deepgram,openai,elevenlabs,groq,google,azure,sarvam,soundfile,silero,webrtc,speechmatics,openrouter,camb,mcp]' && \
-    # Swap opencv-python (pulled by pipecat[webrtc]) for opencv-python-headless
-    # to drop X11/Qt dependencies that otherwise require libxcb etc. in runner.
-    pip uninstall -y opencv-python && \
-    pip install --user --no-cache-dir opencv-python-headless && \
-    # Pre-download NLTK punkt_tab tokenizer data (required by pipecat at runtime)
-    python -c "import nltk; nltk.download('punkt_tab', quiet=True)" && \
-    # Clean up pip cache and temporary pipecat directory
-    rm -rf /root/.cache/pip /tmp/pipecat
+# Layer 1: API deps. Cache invalidates only when requirements.txt changes.
+RUN --mount=type=bind,source=api/requirements.txt,target=/tmp/req.txt \
+    --mount=type=cache,target=/root/.cache/uv \
+    uv pip install -r /tmp/req.txt
 
-# Strip cache files, test/example dirs, and type stubs from installed packages
-RUN find /root/.local -type f -name '*.pyc' -delete && \
-    find /root/.local -type d -name '__pycache__' -prune -exec rm -rf {} + && \
-    find /root/.local -type f -name '*.pyo' -delete && \
-    find /root/.local -type d \( -name tests -o -name test -o -name examples \) -prune -exec rm -rf {} + && \
-    find /root/.local -name '*.pyi' -delete
+# Layer 2: pipecat deps. Cache invalidates when pipecat source changes.
+# After installing pipecat, two hardening tweaks:
+#   1. Swap opencv-python (pulled by pipecat[webrtc]) for opencv-python-headless.
+#      The non-headless build links against X11/Qt (libxcb*); without those
+#      shared libs in the image, `import cv2` fails at runtime.
+#   2. Pre-download NLTK's punkt_tab tokenizer so pipecat's text processing
+#      doesn't hit the network on first agent run. NLTK auto-finds it under
+#      sys.prefix/nltk_data, so it travels with the venv on COPY.
+RUN --mount=type=bind,source=pipecat,target=/tmp/pipecat,rw \
+    --mount=type=cache,target=/root/.cache/uv \
+    uv pip install '/tmp/pipecat[cartesia,deepgram,openai,elevenlabs,groq,google,azure,sarvam,soundfile,silero,webrtc,speechmatics,openrouter,camb,mcp]' \
+ && uv pip uninstall opencv-python \
+ && uv pip install opencv-python-headless \
+ && python -c "import nltk; nltk.download('punkt_tab', download_dir='/opt/venv/nltk_data', quiet=True)"
+
+# Strip cache files, test/example dirs, and type stubs from the venv
+RUN find /opt/venv -type f -name '*.pyc' -delete && \
+    find /opt/venv -type d -name '__pycache__' -prune -exec rm -rf {} + && \
+    find /opt/venv -type f -name '*.pyo' -delete && \
+    find /opt/venv -type d \( -name tests -o -name test -o -name examples \) -prune -exec rm -rf {} + && \
+    find /opt/venv -name '*.pyi' -delete
 
 # Stage 2: Node deps for ts_validator (built with full node:22-slim, only
 # node_modules is copied into the runner).
@@ -46,59 +58,108 @@ RUN npm ci --omit=dev && npm cache clean --force
 
 # Stage 3: Static ffmpeg binary (avoids apt ffmpeg pulling mesa/libllvm for
 # hardware acceleration we don't use server-side).
+#
+# Resilient download: johnvansickle.com is the primary source but it's a single
+# self-hosted host with no CDN and goes down intermittently. Use bounded-timeout
+# retries, then fall back to a pinned BtbN/FFmpeg-Builds autobuild. Every archive
+# is SHA256-verified before extraction. The two sources have different internal
+# layouts, so locate the binaries with `find` rather than a fixed strip path.
 FROM debian:trixie-slim AS ffmpeg-static
+ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates xz-utils \
-    && curl -fsSL -o /tmp/ffmpeg.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+    && rm -rf /var/lib/apt/lists/* \
+    && case "${TARGETARCH}" in \
+         amd64) \
+           primary_url="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" ; \
+           primary_sha256="abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67" ; \
+           fallback_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-05-30-13-19/ffmpeg-N-124681-gb8c5376eb4-linux64-gpl.tar.xz" ; \
+           fallback_sha256="6cfd689ee95ff128e89080af10c93f16e48760eb2acc124c5c8258dc922cc13b" ; \
+           ;; \
+         arm64) \
+           primary_url="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz" ; \
+           primary_sha256="f4149bb2b0784e30e99bdda85471c9b5930d3402014e934a5098b41d0f7201b1" ; \
+           fallback_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-05-30-13-19/ffmpeg-N-124681-gb8c5376eb4-linuxarm64-gpl.tar.xz" ; \
+           fallback_sha256="b90a31f1d0b030f5d8a3d11cfec736e369bd5a1371b19bf65421a07f72b1d547" ; \
+           ;; \
+         *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+       esac \
     && mkdir -p /tmp/ffmpeg \
-    && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg --strip-components=1 \
-    && mv /tmp/ffmpeg/ffmpeg /tmp/ffmpeg/ffprobe /usr/local/bin/ \
-    && chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
+    && ok= \
+    && for source in \
+         "primary ${primary_sha256} ${primary_url}" \
+         "fallback ${fallback_sha256} ${fallback_url}" ; do \
+         source_name="${source%% *}" ; \
+         source_data="${source#* }" ; \
+         sha256="${source_data%% *}" ; \
+         url="${source_data#* }" ; \
+         echo "Downloading ffmpeg (${source_name}) from ${url}" ; \
+         if curl -fsSL --connect-timeout 20 --max-time 300 \
+                 --retry 3 --retry-delay 5 --retry-all-errors \
+                 -o /tmp/ffmpeg.tar.xz "${url}" \
+             && echo "${sha256}  /tmp/ffmpeg.tar.xz" | sha256sum -c - ; then ok=1 ; break ; fi ; \
+         rm -f /tmp/ffmpeg.tar.xz ; \
+         echo "ffmpeg source failed, trying next: ${url}" >&2 ; \
+       done \
+    && [ -n "${ok}" ] || { echo "all ffmpeg download sources failed" >&2 ; exit 1 ; } \
+    && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg \
+    && ffmpeg_bin="$(find /tmp/ffmpeg -type f -name ffmpeg | head -n1)" \
+    && ffprobe_bin="$(find /tmp/ffmpeg -type f -name ffprobe | head -n1)" \
+    && [ -n "${ffmpeg_bin}" ] && [ -n "${ffprobe_bin}" ] \
+    && mv "${ffmpeg_bin}" "${ffprobe_bin}" /usr/local/bin/ \
+    && chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe \
+    && rm -rf /tmp/ffmpeg /tmp/ffmpeg.tar.xz
 
 # Stage 4: Runtime - Minimal image with only runtime dependencies
-FROM python:3.12-slim AS runner
+FROM python:3.13-slim AS runner
 
 WORKDIR /app
+
+RUN groupadd --system dograh \
+ && useradd --system --gid dograh --no-log-init --home-dir /app --shell /usr/sbin/nologin dograh \
+ && chown dograh:dograh /app
 
 # Static ffmpeg + ffprobe (used by audio_converter, audio_file_cache, etc.)
 COPY --from=ffmpeg-static /usr/local/bin/ffmpeg /usr/local/bin/ffmpeg
 COPY --from=ffmpeg-static /usr/local/bin/ffprobe /usr/local/bin/ffprobe
 
 # Node.js 22 binary only (ts_validator subprocess needs node >=22.6 for
-# native TypeScript stripping; see api/mcp_server/ts_bridge.py). python:3.12-slim
+# native TypeScript stripping; see api/mcp_server/ts_bridge.py). python:3.13-slim
 # already provides libstdc++6, libgcc-s1, and ca-certificates that node needs.
 COPY --from=node:22-slim /usr/local/bin/node /usr/local/bin/node
 
-# Copy Python packages from builder stage
-COPY --from=builder /root/.local /root/.local
+# Copy the populated venv from the builder stage. NLTK data lives at
+# /opt/venv/nltk_data and is auto-discovered via sys.prefix.
+COPY --from=builder /opt/venv /opt/venv
 
-# Copy NLTK data (punkt_tab tokenizer) from builder stage
-COPY --from=builder /root/nltk_data /root/nltk_data
-
-# Make sure scripts in .local are available
-ENV PATH=/root/.local/bin:$PATH
+# Activate the venv for subsequent RUN/CMD layers.
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH
 
 # Set Python to not generate .pyc files in runtime
 ENV PYTHONDONTWRITEBYTECODE=1
 # Unbuffered output for better container logging
 ENV PYTHONUNBUFFERED=1
 
-# Copy application code
-COPY ./api ./api
-COPY ./scripts/start_services_docker.sh ./scripts/start_services_docker.sh
+# Copy application code (chown at copy-time avoids a duplicate /app layer
+# from a later `RUN chown -R`, which would double the on-disk size of /app).
+COPY --chown=dograh:dograh ./api ./api
+COPY --chown=dograh:dograh ./scripts/start_services_docker.sh ./scripts/start_services_docker.sh
 
 # ts_validator Node deps (built in ts-deps stage with full node:22-slim image).
 # The validator runs as a short-lived subprocess from api/mcp_server/ts_bridge.py.
-COPY --from=ts-deps /ts_validator/node_modules ./api/mcp_server/ts_validator/node_modules
+COPY --from=ts-deps --chown=dograh:dograh /ts_validator/node_modules ./api/mcp_server/ts_validator/node_modules
 
 # Product documentation — read at runtime by the MCP docs tools
 # (search_dograh_docs / fetch_dograh_doc) so agents can learn Dograh.
-COPY ./docs ./docs
+COPY --chown=dograh:dograh ./docs ./docs
 
 ENV PYTHONPATH=/app
 
 # Disable file logging in Docker - logs go to stdout for docker logs
 ENV LOG_TO_FILE=false
+
+USER dograh
 
 # Expose the port FastAPI will run on
 EXPOSE 8000

@@ -7,6 +7,7 @@ from loguru import logger
 from api.constants import MPS_API_URL
 from api.services.configuration.registry import ServiceProviders
 from api.services.pipecat.minimax_tts import MiniMaxOwnedSessionTTSService
+from api.utils.url_security import validate_user_configured_service_url
 from pipecat.services.assemblyai.stt import AssemblyAISTTService, AssemblyAISTTSettings
 from pipecat.services.aws.llm import AWSBedrockLLMService, AWSBedrockLLMSettings
 from pipecat.services.azure.llm import AzureLLMService, AzureLLMSettings
@@ -47,6 +48,7 @@ from pipecat.services.openai.stt import (
 from pipecat.services.openai.tts import OpenAITTSService, OpenAITTSSettings
 from pipecat.services.openrouter.llm import OpenRouterLLMService, OpenRouterLLMSettings
 from pipecat.services.rime.tts import RimeTTSService, RimeTTSSettings
+from pipecat.services.sarvam.llm import SarvamLLMService, SarvamLLMSettings
 from pipecat.services.sarvam.stt import SarvamSTTService, SarvamSTTSettings
 from pipecat.services.sarvam.tts import SarvamTTSService, SarvamTTSSettings
 from pipecat.services.speaches.llm import SpeachesLLMService, SpeachesLLMSettings
@@ -61,6 +63,16 @@ from pipecat.utils.text.xml_function_tag_filter import XMLFunctionTagFilter
 
 if TYPE_CHECKING:
     from api.services.pipecat.audio_config import AudioConfig
+
+
+def _validate_runtime_service_url(url: str, field_name: str) -> None:
+    try:
+        validate_user_configured_service_url(
+            url,
+            field_name=field_name,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 def create_stt_service(
@@ -149,7 +161,7 @@ def create_stt_service(
             sample_rate=audio_config.transport_in_sample_rate,
         )
     elif user_config.stt.provider == ServiceProviders.SARVAM.value:
-        # Map Sarvam language code to pipecat Language enum
+        language = getattr(user_config.stt, "language", None)
         language_mapping = {
             "bn-IN": Language.BN_IN,
             "gu-IN": Language.GU_IN,
@@ -163,9 +175,18 @@ def create_stt_service(
             "od-IN": Language.OR_IN,
             "en-IN": Language.EN_IN,
             "as-IN": Language.AS_IN,
+            "ur-IN": Language.UR_IN,
+            "kok-IN": Language.KOK_IN,
+            "mai-IN": Language.MAI_IN,
+            "sd-IN": Language.SD_IN,
         }
-        language = getattr(user_config.stt, "language", None)
-        pipecat_language = language_mapping.get(language, Language.HI_IN)
+        if not language or language == "unknown":
+            pipecat_language = None
+        elif language in language_mapping:
+            pipecat_language = language_mapping[language]
+        else:
+            # Unmapped BCP-47 codes pass through; Sarvam accepts them per https://docs.sarvam.ai/api-reference-docs/speech-to-text/transcribe
+            pipecat_language = language
         return SarvamSTTService(
             api_key=user_config.stt.api_key,
             settings=SarvamSTTSettings(
@@ -176,6 +197,7 @@ def create_stt_service(
         )
     elif user_config.stt.provider == ServiceProviders.SPEACHES.value:
         language = getattr(user_config.stt, "language", None)
+        _validate_runtime_service_url(user_config.stt.base_url, "base_url")
         return SpeachesSTTService(
             base_url=user_config.stt.base_url,
             api_key=user_config.stt.api_key or "none",
@@ -312,6 +334,7 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
         # ElevenLabs TTS uses WebSocket. Users configure base_url with an HTTP
         # scheme (matching ElevenLabs documentation, e.g.
         # https://api.eu.residency.elevenlabs.io); rewrite it to the WS scheme.
+        _validate_runtime_service_url(user_config.tts.base_url, "base_url")
         elevenlabs_url = user_config.tts.base_url.replace("https://", "wss://").replace(
             "http://", "ws://"
         )
@@ -394,6 +417,7 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
         tts._settings.language = language
         return tts
     elif user_config.tts.provider == ServiceProviders.SPEACHES.value:
+        _validate_runtime_service_url(user_config.tts.base_url, "base_url")
         return SpeachesTTSService(
             base_url=user_config.tts.base_url,
             api_key=user_config.tts.api_key or "none",
@@ -479,6 +503,7 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
         ).rstrip("/")
         if not base_url.endswith("/t2a_v2"):
             base_url = f"{base_url}/t2a_v2"
+        _validate_runtime_service_url(base_url, "base_url")
 
         session = aiohttp.ClientSession()
         return MiniMaxOwnedSessionTTSService(
@@ -522,6 +547,10 @@ def create_llm_service_from_provider(
     """
     logger.info(f"Creating LLM service: provider={provider}, model={model}")
     if provider == ServiceProviders.OPENAI.value:
+        kwargs = {}
+        if base_url:
+            _validate_runtime_service_url(base_url, "base_url")
+            kwargs["base_url"] = base_url
         if "gpt-5" in model:
             return OpenAILLMService(
                 api_key=api_key,
@@ -529,10 +558,12 @@ def create_llm_service_from_provider(
                     model=model,
                     extra={"reasoning_effort": "minimal", "verbosity": "low"},
                 ),
+                **kwargs,
             )
         return OpenAILLMService(
             api_key=api_key,
             settings=OpenAILLMSettings(model=model, temperature=0.1),
+            **kwargs,
         )
     elif provider == ServiceProviders.GROQ.value:
         return GroqLLMService(
@@ -542,6 +573,7 @@ def create_llm_service_from_provider(
     elif provider == ServiceProviders.OPENROUTER.value:
         kwargs = {}
         if base_url:
+            _validate_runtime_service_url(base_url, "base_url")
             kwargs["base_url"] = base_url
         return OpenRouterLLMService(
             api_key=api_key,
@@ -561,6 +593,8 @@ def create_llm_service_from_provider(
             settings=GoogleVertexLLMSettings(model=model, temperature=0.1),
         )
     elif provider == ServiceProviders.AZURE.value:
+        if endpoint:
+            _validate_runtime_service_url(endpoint, "endpoint")
         return AzureLLMService(
             api_key=api_key,
             endpoint=endpoint,
@@ -580,18 +614,30 @@ def create_llm_service_from_provider(
             settings=AWSBedrockLLMSettings(model=model),
         )
     elif provider == ServiceProviders.SPEACHES.value:
+        base_url = base_url or "http://localhost:11434/v1"
+        _validate_runtime_service_url(base_url, "base_url")
         return SpeachesLLMService(
-            base_url=base_url or "http://localhost:11434/v1",
+            base_url=base_url,
             api_key=api_key or "none",
             settings=SpeachesLLMSettings(model=model),
         )
     elif provider == ServiceProviders.MINIMAX.value:
+        base_url = base_url or "https://api.minimax.io/v1"
+        _validate_runtime_service_url(base_url, "base_url")
         return MiniMaxLLMService(
             api_key=api_key,
-            base_url=base_url or "https://api.minimax.io/v1",
+            base_url=base_url,
             settings=MiniMaxLLMService.Settings(
                 model=model,
                 temperature=temperature if temperature is not None else 1.0,
+            ),
+        )
+    elif provider == ServiceProviders.SARVAM.value:
+        return SarvamLLMService(
+            api_key=api_key,
+            settings=SarvamLLMSettings(
+                model=model,
+                temperature=temperature if temperature is not None else 0.5,
             ),
         )
     else:
@@ -727,7 +773,9 @@ def create_llm_service(user_config):
     api_key = user_config.llm.api_key
 
     kwargs = {}
-    if provider == ServiceProviders.OPENROUTER.value:
+    if provider == ServiceProviders.OPENAI.value:
+        kwargs["base_url"] = user_config.llm.base_url
+    elif provider == ServiceProviders.OPENROUTER.value:
         kwargs["base_url"] = user_config.llm.base_url
     elif provider == ServiceProviders.AZURE.value:
         kwargs["endpoint"] = user_config.llm.endpoint
@@ -743,6 +791,8 @@ def create_llm_service(user_config):
         kwargs["credentials"] = user_config.llm.credentials
     elif provider == ServiceProviders.MINIMAX.value:
         kwargs["base_url"] = user_config.llm.base_url
+        kwargs["temperature"] = user_config.llm.temperature
+    elif provider == ServiceProviders.SARVAM.value:
         kwargs["temperature"] = user_config.llm.temperature
 
     return create_llm_service_from_provider(provider, model, api_key, **kwargs)
